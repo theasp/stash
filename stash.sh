@@ -1,16 +1,16 @@
 #!/bin/bash
 
-set -x
+set -ex
 
 OPTIONS="dek:c:D:"
-CIPHER=aes-256-gcm
+CIPHER=aes-256-cbc
 MODE=encrypt
-DIGEST=sha512
+HMAC=sha512
 
 if ( ! getopts $OPTIONS opt); then
   cat >&2 <<EOF
 Usage:
-  Encrypt: `basename $0` -e [-k key] [-c cipher] [-D digest] [in] [out]
+  Encrypt: `basename $0` -e [-k key] [-c cipher] [-H hmac] [in] [out]
   Decrypt: `basename $0` -d -k <key> [in] [out]
 EOF
   exit $E_OPTERROR;
@@ -21,7 +21,7 @@ while getopts $OPTIONS opt; do
     e) MODE=encrypt ;;
     d) MODE=decrypt ;;
     c) CIPHER=$OPTARG ;;
-    D) DIGEST=$OPTARG ;;    
+    D) DIGEST=$OPTARG ;;
     k) KEY=$OPTARG ;;
   esac
 done
@@ -42,41 +42,98 @@ if [[ -z $WRITE ]] || [[ $WRITE = '-' ]]; then
   WRITE=/dev/stdout
 fi
 
-function stash_make_nonce() {
-  SIZE=${1:-16}
-  RET=$(date +"%s %N" | awk '{printf "%08x%08x\n", $1, $2}' | cut -c 1-$SIZE)
+function error() {
+  echo "ERROR: $*" 1>&2
+  rm -rf $TMPDIR
+  exit 1
 }
 
-function stash_digest() {
+function stash_make_nonce() {
+  SIZE=${1:-16}
+  RANDOM=$(( $SIZE - 16 ))
+  if [[ $RANDOM -gt 0 ]]; then
+    #RANDOM=$(openssl rand -hex $RANDOM)
+    true
+  else
+    RANDOM=""
+  fi
+  RET=$(date +"%s %N $RANDOM" | awk '{printf "%08x%08x%s\n", $1, $2, $3}' | cut -c 1-$SIZE)
+}
+
+function stash_hmac() {
   local DIGEST=$1
-  local FILE=$2
+  local KEY=$2
+  local FILE=$3
+  local CMD
 
   case $DIGEST in
     sha|sha1|sha-1|SHA|SHA1|SHA-1)
-      RET=$(sha1sum $FILE | cut -f 1 -d ' ') ;;
-    
+      CMD="-sha1"
+      DIGEST=sha1
+      ;;
+
     sha224|sha-224|SHA224|SHA-224)
-      RET=$(sha224sum $FILE | cut -f 1 -d ' ') ;;
-    
+      CMD="-sha224"
+      DIGEST=sha224
+      ;;
+
     sha256|sha-256|SHA256|SHA-256)
-      RET=$(sha256sum $FILE | cut -f 1 -d ' ') ;;
+      CMD="-sha256"
+      DIGEST=sha256
+      ;;
 
     sha384|sha-384|SHA384|SHA-384)
-      RET=$(sha384sum $FILE | cut -f 1 -d ' ') ;;
+      CMD="-sha384"
+      DIGEST=sha384
+      ;;
 
     sha512|sha-512|SHA512|SHA-512)
-      RET=$(sha512sum $FILE | cut -f 1 -d ' ') ;;
+      CMD="-sha512"
+      DIGEST=sha512
+      ;;
+    *)
+      error "Unknown digest: $DIGEST" ;;
+  esac
 
-    md5|MD5)
-      RET=$(md5sum $FILE | cut -f 1 -d ' ') ;;
+  set -- $(openssl dgst -r -hmac $KEY $CMD < $FILE)
+  RET="$DIGEST $1"
+}
+
+function stash_cipher_params() {
+  case $1 in
+    aes128|aes-128-cbc|AES-128-CBC)
+      RET="aes-128-cbc 8"
+      ;;
+
+    aes192|aes-192-cbc|AES-192-CBC)
+      RET="aes-192-cbc 24"
+      ;;
+
+    aes256|aes-256-cbc|AES-256-CBC)
+      RET="aes-256-cbc 16"
+      ;;
+
+    *)
+      error "Unknown cipher: $CIPHER"
   esac
 }
 
 function stash_encrypt() {
-  echo "Read: $READ  Write: $WRITE"
-  
+  stash_cipher_params $CIPHER
+  set -- $RET
+  CIPHER=$1
+  BSIZE=$2
+
   if [[ -z $KEY ]]; then
-    KEY=$(openssl rand -hex 16)
+    if [[ $STASH_KEY ]]; then
+      KEY=$STASH_KEY
+    else
+      KEY=$(openssl rand -hex $BSIZE)
+    fi
+  fi
+
+  if [[ ${#KEY} -ne $(( $BSIZE * 2 )) ]]; then
+    error "Supplied key is not the correct length: ${#KEY} != $BSIZE"
   fi
 
   stash_make_nonce
@@ -84,27 +141,60 @@ function stash_encrypt() {
 
   cat $READ > $TMPDIR/unencrypted
 
-  stash_digest $DIGEST $TMPDIR/unencrypted
-  DIGEST_DATA=$RET
-
-  openssl $CIPHER -e -K $KEY -iv $IV < $TMPDIR/unencrypted > $TMPDIR/encrypted
-  rm -f $TMPDIR/unencrypted
+  stash_hmac $HMAC $KEY $TMPDIR/unencrypted
+  HMAC_DATA=$RET
   
-  cat > $TMPDIR/control <<EOF
-IV: $IV
-Cipher: $CIPHER
-Digest: $DIGEST $DIGEST_DATA
-EOF
+  openssl enc -e -$CIPHER -K $KEY -iv $IV -in $TMPDIR/unencrypted -out $TMPDIR/encrypted || error "Unable to encrypt data"
+  rm -f $TMPDIR/unencrypted
 
+  cat > $TMPDIR/control <<EOF
+Cipher: $CIPHER
+IV: $IV
+HMAC: $HMAC_DATA
+EOF
+  
   echo "Key: $KEY" 1>&2
   cat $TMPDIR/control 1>&2
+
+  cat > $TMPDIR/manifest <<EOF
+control
+encrypted
+EOF
   
-  ar r $TMPDIR/stash $TMPDIR/control $TMPDIR/encrypted
-  cat $TMPDIR/stash > $WRITE
+  #tar -C $TMPDIR -c control encrypted | base64
+  (cd $TMPDIR && cat manifest | cpio -o > $WRITE)
 }
 
 function stash_decrypt() {
-  false
+  if [[ -z $KEY ]]; then
+    error "Unable to decrypt without supplying a key"
+  fi
+  
+  (cd $TMPDIR && cpio -i) < $READ
+  set -- $(grep "^Cipher:" < $TMPDIR/control)
+  CIPHER=$2
+
+  set -- $(grep "^HMAC:" < $TMPDIR/control)
+  HMAC=$2
+
+  set -- $(grep "^IV:" < $TMPDIR/control)
+  IV=$2
+
+  stash_cipher_params $CIPHER
+  set -- $RET
+  CIPHER=$1
+  BSIZE=$2
+
+  openssl enc -d -$CIPHER -K $KEY -iv $IV -in $TMPDIR/encrypted -out $TMPDIR/unencrypted || error "Unable to encrypt data"
+  rm -rf $TMPDIR/encrypted
+
+  stash_hmac $HMAC $KEY $TMPDIR/unencrypted
+  set -- $RET
+  ACTUAL_HMAC=$2
+
+  cat $TMPDIR/unencrypted > $WRITE
+  
+  ls -l $TMPDIR
 }
 
 case $MODE in
