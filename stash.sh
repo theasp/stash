@@ -2,14 +2,36 @@
 
 set -e
 
-OPTIONS="dek:c:D:"
+# Defaults
 CIPHER=${STASH_CIPHER:-aes-256-cbc}
 MODE=decrypt
 HMAC=${STASH_HMAC:-sha512}
 KEY=$STASH_KEY
+KEYGEN=false
 TMPDIRCLEAN=true
 INFILE=-
 OUTFILE=-
+VERBOSE=false
+
+function stash_cleanup() {
+  if [[ $TMPDIR ]] && [[ $TMPDIRCLEAN = true ]]; then
+    rm -rf $TMPDIR
+  fi
+}
+
+function error() {
+  echo "ERROR: $*" 1>&2
+  stash_cleanup
+  exit 1
+}
+
+function warn() {
+  echo "WARNING: $*" 1>&2
+}
+
+function info() {
+  echo "INFO: $*" 1>&2
+}
 
 function stash_usage() {
   cat >&2 <<EOF
@@ -35,6 +57,8 @@ Encrypt or decrypt a file from INFILE (or STDIN) into OUTFILE (or STDOUT).
       sha512 (default), sha384, sha256, sha224, sha
   -T TMPDIR, --tmpdir TMPDIR
       Use TMPDIR to (de)construct the stash file.
+  -v, --verbose
+      More output.
 
 You may override the defaults using the following variables:
 STASH_KEY, STASH_CIPHER, and STASH_HMAC.
@@ -42,86 +66,91 @@ EOF
   exit 1
 }
 
-while true ; do
-  case "$1" in
-    -e|--encrypt)
-      MODE=encrypt
-      shift
-      ;;
+# Parse arguments
+function stash_getopts() {
+  while true; do
+    case "$1" in
+      -e|--encrypt)
+        MODE=encrypt
+        shift
+        ;;
 
-    -d|--decrypt)
-      MODE=decrypt
-      shift
-      ;;
+      -d|--decrypt)
+        MODE=decrypt
+        shift
+        ;;
 
-    -k|--key)
-      KEY=$2
-      shift 2
-      ;;
+      -k|--key)
+        KEY=$2
+        shift 2
+        ;;
 
-    -c|--cipher)
-      CIPHER=$2
-      shift 2
-      ;;
+      -c|--cipher)
+        CIPHER=$2
+        shift 2
+        ;;
 
-    -H|--hmac)
-      HMAC=$2
-      shift 2
-      ;;
+      -H|--hmac)
+        HMAC=$2
+        shift 2
+        ;;
 
-    -i|--in)
-      INFILE=$2
-      shift 2
-      ;;
+      -i|--in)
+        INFILE=$2
+        shift 2
+        ;;
 
-    -o|--out)
-      OUTFILE=$2
-      shift 2
-      ;;
+      -o|--out)
+        OUTFILE=$2
+        shift 2
+        ;;
 
-    -T|--tmpdir)
-      TMPDIR=$2
-      TMPDIRCLEAN=false
-      shift 2
-      ;;
+      -T|--tmpdir)
+        TMPDIR=$2
+        TMPDIRCLEAN=false
+        shift 2
+        ;;
 
-    --)
-      shift
-      break
-      ;;
+      -v|--verbose)
+        VERBOSE=true
+        shift
+        ;;
 
-    -*)
-      echo "ERROR: Unknown option: $1" 1>&2
-      stash_usage
-      ;;
+      --)
+        shift
+        break
+        ;;
 
-    *)
-      break
-      ;;
-  esac
-done
+      -*)
+        echo "ERROR: Unknown option: $1" 1>&2
+        stash_usage
+        ;;
 
-if [[ -z $TMPDIR ]]; then
-  TMPDIR=$(mktemp -d /tmp/stash-XXXXXXXXXX)
-fi
+      *)
+        break
+        ;;
+    esac
+  done
 
-if [[ -z $INFILE ]] || [[ $INFILE = '-' ]]; then
-  INFILE=/dev/stdin
-fi
+  if [[ -z $TMPDIR ]]; then
+    TMPDIR=$(mktemp -d /tmp/stash-XXXXXXXXXX)
+  fi
 
-if [[ -z $OUTFILE ]] || [[ $OUTFILE = '-' ]]; then
-  OUTFILE=/dev/stdout
-fi
+  if [[ -z $INFILE ]] || [[ $INFILE = '-' ]]; then
+    INFILE=/dev/stdin
+  fi
 
-function error() {
-  echo "ERROR: $*" 1>&2
-  rm -rf $TMPDIR
-  exit 1
+  if [[ -z $OUTFILE ]] || [[ $OUTFILE = '-' ]]; then
+    OUTFILE=/dev/stdout
+  fi
 }
 
+
+# Generate a nonce of atleast 16 bytes using the system clock, and add
+# extra bytes of random to get the desired length.
 function stash_nonce() {
   SIZE=$(( $1 + 0 ))
-  LENGTH=$(( $1 * 2 ))
+  LENGTH=$(( $1 * 2 )) # * 2 for hex length
 
   if [[ $SIZE -lt 16 ]]; then
     error "Unable to create nonce shorter than 16 bytes"
@@ -135,6 +164,8 @@ function stash_nonce() {
   fi
 }
 
+# Calculate the HMAC for a given key.
+# TODO: Handle wrong sized key?
 function openssl_hmac() {
   local DIGEST=$1
   local KEY=$2
@@ -167,12 +198,13 @@ function openssl_hmac() {
   echo "$DIGEST $1"
 }
 
+# Get the openssl cipher name, key size and iv size.
 function stash_cipher_params() {
-  local CIPHER
+  local CIPHER=$1
   local KEYSIZE
   local IVSIZE
 
-  case $1 in
+  case $CIPHER in
     aes128|aes-128-cbc|AES-128-CBC)
       CIPHER=aes-128-cbc
       KEYSIZE=16
@@ -202,7 +234,8 @@ function stash_cipher_params() {
   echo "$CIPHER $KEYSIZE $IVSIZE"
 }
 
-function check_key_iv() {
+# Verify the key and IV are the correct sizes.
+function stash_verify_keyiv() {
   local CIPHER=$1
   local KEY=$2
   local IV=$3
@@ -220,22 +253,24 @@ function check_key_iv() {
   fi
 }
 
+# Encrypt data
 function openssl_encrypt() {
-  local CIPHER=$1
-  local KEY=$2
-  local IV=$3
-
-  openssl enc -e -$CIPHER -K $KEY -iv $IV
+  openssl enc -e -$1 -K $2 -iv $3
 }
 
+# Decrypt data
 function openssl_decrypt() {
-  local CIPHER=$1
-  local KEY=$2
-  local IV=$3
-
-  openssl enc -d -$CIPHER -K $KEY -iv $IV
+  openssl enc -d -$1 -K $2 -iv $3
 }
 
+# Create a container using cpio with the encrypted version of
+# INFILE. The minimum size of tar is rather big, and ar can't be used
+# with stdin/out.  The container contains the files `meta` and
+# `encrypted`. `meta` looks like this:
+# Timestamp: 2017-01-11T20:31:37+0000
+# Cipher: aes-256-cbc
+# IV: 58769629098ad8d4c7da6cd41692543b
+# HMAC: sha512 0d3a65b8d1680aca0a80c6f93441a12c1140e3c2a8f3b77ba8a3e392b1466704b742b84c83e519368a27f4a7d10abfe227b73314663dfc202731c5e9db09ff03
 function stash_encrypt() {
   set -- $(stash_cipher_params $CIPHER)
   CIPHER=$1
@@ -247,30 +282,49 @@ function stash_encrypt() {
       KEY=$STASH_KEY
     else
       KEY=$(openssl rand -hex $KEYSIZE)
+      KEYGEN=true
     fi
   fi
 
   stash_nonce $IVSIZE
   IV=$RET
 
-  check_key_iv $CIPHER $KEY $IV
+  stash_verify_keyiv $CIPHER $KEY $IV
 
+  # Use process redirectgion to write the encrypted data to
+  # $TMPDIR/encrypted while calculating the HMAC at the same time.
+  # This is to prevent unencrypted data from going to disk, unless
+  # bash is emulating process redirection on your operating system.
   HMAC_DATA=$(tee < $INFILE >(openssl_encrypt $CIPHER $KEY $IV > $TMPDIR/encrypted) | openssl_hmac $HMAC $KEY)
 
-  echo "Timestamp: $(date -u --iso-8601=seconds)" > $TMPDIR/control
-  echo "Cipher: $CIPHER" >> $TMPDIR/control
-  echo "IV: $IV" >> $TMPDIR/control
-  echo "HMAC: $HMAC_DATA" >> $TMPDIR/control
+  echo "Timestamp: $(date -u --iso-8601=seconds)" > $TMPDIR/meta
+  echo "Cipher: $CIPHER" >> $TMPDIR/meta
+  echo "IV: $IV" >> $TMPDIR/meta
+  echo "HMAC: $HMAC_DATA" >> $TMPDIR/meta
 
-  cat $TMPDIR/control 1>&2
-  echo "Key: $KEY" 1>&2
+  if [[ $VERBOSE = true ]]; then
+    info "Meta:"
+    cat $TMPDIR/meta | sed -e 's/^/\ci/' 1>&2
+  fi
 
-  echo "control" > $TMPDIR/manifest
+  if [[ $KEYGEN = true ]] || [[ $VERBOSE = true ]]; then
+    info "Key: $KEY"
+  fi
+
+  echo "meta" > $TMPDIR/manifest
   echo "encrypted" >> $TMPDIR/manifest
 
   (cd $TMPDIR && cat manifest | cpio --quiet -o) > $OUTFILE
+
+  if [[ $VERBOSE = true ]]; then
+    info "Encryption successful"
+  fi
 }
 
+# Extract the files from the container, decrypt and verify the HMAC.
+# If the HMAC matches the value from the container, decrypt again and
+# put in $OUTFILE.  TODO: I would like to avoid the double decryption
+# without writing to disk.
 function stash_decrypt() {
   if [[ -z $KEY ]]; then
     error "Unable to decrypt without providing a key"
@@ -294,9 +348,9 @@ function stash_decrypt() {
         IV=$2
         ;;
     esac
-  done < $TMPDIR/control
+  done < $TMPDIR/meta
 
-  check_key_iv $CIPHER $KEY $IV
+  stash_verify_keyiv $CIPHER $KEY $IV
 
   HMAC_DATA=$(openssl_decrypt $CIPHER $KEY $IV < $TMPDIR/encrypted | openssl_hmac $HMAC $KEY)
   set -- $HMAC_DATA
@@ -307,15 +361,24 @@ function stash_decrypt() {
   fi
 
   openssl_decrypt $CIPHER $KEY $IV < $TMPDIR/encrypted > $OUTFILE
+
+  if [[ $VERBOSE = true ]]; then
+    info "Decryption successful"
+  fi
 }
 
-case $MODE in
-  encrypt) stash_encrypt ;;
-  decrypt) stash_decrypt ;;
-esac
+# Main function
+function stash_main() {
+  stash_getopts "$@"
 
-if [[ $TMPDIRCLEAN = true ]]; then
-  rm -rf $TMPDIR
-fi
+  case $MODE in
+    encrypt) stash_encrypt ;;
+    decrypt) stash_decrypt ;;
+  esac
 
-exit 0
+  stash_cleanup
+
+  exit 0
+}
+
+stash_main "$@"
