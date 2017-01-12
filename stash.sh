@@ -5,7 +5,7 @@ set -e
 # Defaults
 CIPHER=${STASH_CIPHER:-aes-256-cbc}
 MODE=decrypt
-HMAC=${STASH_HMAC:-sha512}
+DIGEST=${STASH_DIGEST:-sha512}
 KEY=$STASH_KEY
 KEYGEN=false
 TMPDIRCLEAN=true
@@ -52,7 +52,7 @@ Encrypt or decrypt a file from INFILE (or STDIN) into OUTFILE (or STDOUT).
   -c CIPHER, --cipher CIPHER
       Specify a cipher from one of: aes-256-cbc (default),
       aes-192-cbc, or aes-128-cbc.
-  -H DIGEST, --hmac DIGEST
+  -D DIGEST, --digest DIGEST
       Specify the digest algorithm to use for the HMAC from one of:
       sha512 (default), sha384, sha256, sha224, sha
   -T TMPDIR, --tmpdir TMPDIR
@@ -295,12 +295,12 @@ function stash_encrypt() {
   # $TMPDIR/encrypted while calculating the HMAC at the same time.
   # This is to prevent unencrypted data from going to disk, unless
   # bash is emulating process redirection on your operating system.
-  HMAC_DATA=$(tee < $INFILE >(openssl_encrypt $CIPHER $KEY $IV > $TMPDIR/encrypted) | openssl_hmac $HMAC $KEY)
+  HMAC=$(tee < $INFILE >(openssl_encrypt $CIPHER $KEY $IV > $TMPDIR/encrypted) | openssl_hmac $DIGEST $KEY)
 
   echo "Timestamp: $(date -u --iso-8601=seconds)" > $TMPDIR/meta
   echo "Cipher: $CIPHER" >> $TMPDIR/meta
   echo "IV: $IV" >> $TMPDIR/meta
-  echo "HMAC: $HMAC_DATA" >> $TMPDIR/meta
+  echo "HMAC: $HMAC" >> $TMPDIR/meta
 
   if [[ $VERBOSE = true ]]; then
     info "Meta:"
@@ -340,7 +340,7 @@ function stash_decrypt() {
         ;;
 
       HMAC:)
-        HMAC=$2
+        DIGEST=$2
         HMAC_OK=$3
         ;;
 
@@ -352,7 +352,7 @@ function stash_decrypt() {
 
   stash_verify_keyiv $CIPHER $KEY $IV
 
-  HMAC_DATA=$(openssl_decrypt $CIPHER $KEY $IV < $TMPDIR/encrypted | openssl_hmac $HMAC $KEY)
+  HMAC_DATA=$(openssl_decrypt $CIPHER $KEY $IV < $TMPDIR/encrypted | openssl_hmac $DIGEST $KEY)
   set -- $HMAC_DATA
   HMAC_OUT=$2
 
