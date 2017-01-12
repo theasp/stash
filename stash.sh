@@ -33,8 +33,12 @@ function info() {
   echo "INFO: $*" 1>&2
 }
 
+function info-sed() {
+  sed -e 's/^/INFO: /' 1>&2
+}
+
 function stash_usage() {
-  cat >&2 <<EOF
+  cat <<EOF
 Usage: `basename $0` [OPTION]
 Encrypt or decrypt a file from INFILE (or STDIN) into OUTFILE (or STDOUT).
 
@@ -58,12 +62,14 @@ Encrypt or decrypt a file from INFILE (or STDIN) into OUTFILE (or STDOUT).
   -T TMPDIR, --tmpdir TMPDIR
       Use TMPDIR to (de)construct the stash file.
   -v, --verbose
-      More output.
+      More output. IMPORTANT: Includes information that should be kept
+      secret.
+  -h, --help
+      This help message.
 
 You may override the defaults using the following variables:
-STASH_KEY, STASH_CIPHER, and STASH_HMAC.
+STASH_KEY, STASH_CIPHER, and STASH_DIGEST.
 EOF
-  exit 1
 }
 
 # Parse arguments
@@ -90,8 +96,13 @@ function stash_getopts() {
         shift 2
         ;;
 
-      -H|--hmac)
-        HMAC=$2
+      -h|--help)
+        stash_usage
+        exit 0
+        ;;
+
+      -D|--digest)
+        DIGEST=$2
         shift 2
         ;;
 
@@ -123,7 +134,8 @@ function stash_getopts() {
 
       -*)
         echo "ERROR: Unknown option: $1" 1>&2
-        stash_usage
+        stash_usage 1>&2
+        exit 1
         ;;
 
       *)
@@ -154,13 +166,14 @@ function stash_nonce() {
 
   if [[ $SIZE -lt 16 ]]; then
     error "Unable to create nonce shorter than 16 bytes"
-  fi
+  else
+    RET=$(date +"%s %N" | awk '{printf "%08x%08x\n", $1, $2}')
 
-  RET=$(date +"%s %N" | awk '{printf "%08x%08x\n", $1, $2}')
-
-  EXTRA=$(( $LENGTH - ${#RET} ))
-  if [[ $EXTRA -gt 0 ]]; then
-    RET="$RET$(openssl rand -hex $(( $EXTRA / 2 )))"
+    EXTRA=$(( $LENGTH - ${#RET} ))
+    if [[ $EXTRA -gt 0 ]]; then
+      EXTRA=$(( $EXTRA / 2 ))
+      RET="$RET$(openssl rand -hex $EXTRA)"
+    fi
   fi
 }
 
@@ -265,12 +278,7 @@ function openssl_decrypt() {
 
 # Create a container using cpio with the encrypted version of
 # INFILE. The minimum size of tar is rather big, and ar can't be used
-# with stdin/out.  The container contains the files `meta` and
-# `encrypted`. `meta` looks like this:
-# Timestamp: 2017-01-11T20:31:37+0000
-# Cipher: aes-256-cbc
-# IV: 58769629098ad8d4c7da6cd41692543b
-# HMAC: sha512 0d3a65b8d1680aca0a80c6f93441a12c1140e3c2a8f3b77ba8a3e392b1466704b742b84c83e519368a27f4a7d10abfe227b73314663dfc202731c5e9db09ff03
+# with stdin/out
 function stash_encrypt() {
   set -- $(stash_cipher_params $CIPHER)
   CIPHER=$1
@@ -303,21 +311,17 @@ function stash_encrypt() {
   echo "HMAC: $HMAC" >> $TMPDIR/meta
 
   if [[ $VERBOSE = true ]]; then
-    info "Meta:"
-    cat $TMPDIR/meta | sed -e 's/^/\ci/' 1>&2
+    cat $TMPDIR/meta | info-sed 1>&2
   fi
 
   if [[ $KEYGEN = true ]] || [[ $VERBOSE = true ]]; then
     info "Key: $KEY"
   fi
 
-  echo "meta" > $TMPDIR/manifest
-  echo "encrypted" >> $TMPDIR/manifest
-
-  (cd $TMPDIR && cat manifest | cpio --quiet -o) > $OUTFILE
+  (cd $TMPDIR && (echo meta; echo encrypted) | cpio --quiet -o) > $OUTFILE
 
   if [[ $VERBOSE = true ]]; then
-    info "Encryption successful"
+    info "Encryption successful, to decrypt: $0 -d -k $KEY -i $OUTFILE -o $INFILE"
   fi
 }
 
