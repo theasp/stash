@@ -200,10 +200,8 @@ function stash_nonce() {
 
 # Calculate the HMAC for a given key.
 function openssl_hmac() {
-  local DIGEST=$1
+  local DIGEST=$(echo $1 | tr '[:upper:]' '[:lower:]')
   local KEY=$2
-
-  DIGEST=$(echo $DIGEST | tr '[:upper:]' '[:lower:]')
 
   case $DIGEST in
     sha|sha1|sha-1)    DIGEST=sha1 ;;
@@ -354,7 +352,7 @@ function stash_encrypt() {
 
   openssl_encrypt $CIPHER $KEY $IV < $INFILE > $TMPDIR/encrypted
   if [[ $NEED_HMAC = true ]]; then
-    HMAC=$(cat $TMPDIR/encrypted <(echo $IV) | openssl_hmac $DIGEST $KEY)
+    HMAC=$(cat $TMPDIR/encrypted <(echo $IV) | openssl_hmac "$DIGEST" "$KEY")
   else
     HMAC=""
   fi
@@ -421,7 +419,7 @@ function stash_decrypt() {
   fi
 
   if [[ $HMAC_OK ]]; then
-    HMAC=$(cat $TMPDIR/encrypted <(echo $IV) | openssl_hmac $DIGEST $KEY)
+    HMAC=$(cat $TMPDIR/encrypted <(echo $IV) | openssl_hmac "$DIGEST" "$KEY")
     set -- $HMAC
     HMAC_OUT=$2
 
