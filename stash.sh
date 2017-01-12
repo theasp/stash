@@ -325,7 +325,7 @@ function openssl_decrypt() {
   local IV=$3
   stash_verify_keyiv $CIPHER $KEY $IV
 
-  openssl enc -e -$CIPHER -K $KEY -iv $IV
+  openssl enc -d -$CIPHER -K $KEY -iv $IV
 }
 
 # Create a container using cpio with the encrypted version of
