@@ -3,15 +3,15 @@
 set -e
 
 # Defaults
-CIPHER=${STASH_CIPHER:-aes-256-cbc}
+CIPHER=${STASH_CIPHER}
 MODE=decrypt
-DIGEST=${STASH_DIGEST:-sha512}
+DIGEST=${STASH_DIGEST}
 KEY=$STASH_KEY
 KEYGEN=false
 TMPDIRCLEAN=true
 INFILE=-
 OUTFILE=-
-VERBOSE=false
+LOGLEVEL=2
 
 function stash_cleanup() {
   if [[ $TMPDIR ]] && [[ $TMPDIRCLEAN = true ]]; then
@@ -19,22 +19,34 @@ function stash_cleanup() {
   fi
 }
 
+function log-s () {
+  local TAG=$1
+  local L
+
+  case $TAG in
+    debug) L=3 TAG="DEBUG" ;;
+    info)  L=2 TAG="INFO" ;;
+    warn)  L=1 TAG="WARNING" ;;
+    *)     L=0 TAG="ERROR";;
+  esac
+
+  if [[ $L -le $LOGLEVEL ]]; then
+    sed -e "s/^/$TAG: /" 1>&2
+  else
+    cat > /dev/null
+  fi
+}
+
+function log() {
+  local LEVEL=$1
+  shift
+  echo "$@" | log-s $LEVEL
+}
+
 function error() {
-  echo "ERROR: $*" 1>&2
+  log error "$@"
   stash_cleanup
   exit 1
-}
-
-function warn() {
-  echo "WARNING: $*" 1>&2
-}
-
-function info() {
-  echo "INFO: $*" 1>&2
-}
-
-function info-sed() {
-  sed -e 's/^/INFO: /' 1>&2
 }
 
 function stash_usage() {
@@ -52,7 +64,8 @@ Encrypt or decrypt a file from INFILE (or STDIN) into OUTFILE (or STDOUT).
   -o OUTFILE, --out OUTFILE
       The name of the output file, or - for STDOUT (default).
   -k KEY, --key KEY
-      A key of appropriate length in hex format.
+      A key in hex format, or the absolute path to a file containing a
+      key.
   -c CIPHER, --cipher CIPHER
       Specify a cipher from one of: aes-256-cbc (default),
       aes-192-cbc, or aes-128-cbc.
@@ -61,14 +74,18 @@ Encrypt or decrypt a file from INFILE (or STDIN) into OUTFILE (or STDOUT).
       sha512 (default), sha384, sha256, sha224, sha
   -T TMPDIR, --tmpdir TMPDIR
       Use TMPDIR to (de)construct the stash file.
-  -v, --verbose
-      More output. IMPORTANT: Includes information that should be kept
-      secret.
+  -v, -d, --verbose, --debug
+      More output. IMPORTANT: When encrypting, this includes
+      information that should be kept secret.
   -h, --help
       This help message.
 
 You may override the defaults using the following variables:
-STASH_KEY, STASH_CIPHER, and STASH_DIGEST.
+STASH_KEY, STASH_CIPHER, and STASH_DIGEST.  The value for the key must
+be kept secret.  It is far safer to use the STASH_KEY variable rather
+than passing the key on the command line.  Also keep in mind that any
+command you type into a shell will likely be recorded in it's history
+file.
 EOF
 }
 
@@ -123,7 +140,7 @@ function stash_getopts() {
         ;;
 
       -v|--verbose)
-        VERBOSE=true
+        LOGLEVEL=3
         shift
         ;;
 
@@ -155,6 +172,10 @@ function stash_getopts() {
   if [[ -z $OUTFILE ]] || [[ $OUTFILE = '-' ]]; then
     OUTFILE=/dev/stdout
   fi
+
+  if [[ ${KEY} =~ ^/ ]]; then
+    KEY=$(cat $KEY)
+  fi
 }
 
 
@@ -162,7 +183,7 @@ function stash_getopts() {
 # extra bytes of random to get the desired length.
 function stash_nonce() {
   SIZE=$(( $1 + 0 ))
-  LENGTH=$(( $1 * 2 )) # * 2 for hex length
+  LENGTH=$(( $SIZE * 2 )) # * 2 for hex length
 
   if [[ $SIZE -lt 16 ]]; then
     error "Unable to create nonce shorter than 16 bytes"
@@ -178,31 +199,19 @@ function stash_nonce() {
 }
 
 # Calculate the HMAC for a given key.
-# TODO: Handle wrong sized key?
 function openssl_hmac() {
   local DIGEST=$1
   local KEY=$2
 
+  DIGEST=$(echo $DIGEST | tr '[:upper:]' '[:lower:]')
+
   case $DIGEST in
-    sha|sha1|sha-1|SHA|SHA1|SHA-1)
-      DIGEST=sha1
-      ;;
+    sha|sha1|sha-1)    DIGEST=sha1 ;;
+    sha224|sha-224)    DIGEST=sha224 ;;
+    sha256|sha-256)    DIGEST=sha256 ;;
+    sha384|sha-384)    DIGEST=sha384 ;;
+    sha512|sha-512|"") DIGEST=sha512 ;;
 
-    sha224|sha-224|SHA224|SHA-224)
-      DIGEST=sha224
-      ;;
-
-    sha256|sha-256|SHA256|SHA-256)
-      DIGEST=sha256
-      ;;
-
-    sha384|sha-384|SHA384|SHA-384)
-      DIGEST=sha384
-      ;;
-
-    sha512|sha-512|SHA512|SHA-512)
-      DIGEST=sha512
-      ;;
     *)
       error "Unknown digest: $DIGEST" ;;
   esac
@@ -211,40 +220,72 @@ function openssl_hmac() {
   echo "$DIGEST $1"
 }
 
+function stash_cipher_alias() {
+  local CIPHER=$1
+
+  CIPHER=$(echo $CIPHER | tr '[:upper:]' '[:lower:]')
+
+  case $CIPHER in
+    aes128) CIPHER=aes-128-cbc ;;
+    aes192) CIPHER=aes-192-cbc ;;
+    aes256) CIPHER=aes-256-cbc ;;
+    "")     CIPHER=${STASH_CIPHER:-aes-256-cbc} ;;
+  esac
+
+  echo "$CIPHER"
+}
+
+function stash_cipher_keysize() {
+  local CIPHER=$1
+
+  case $CIPHER in
+    *-128-*|*128) KEYSIZE=16 ;;
+    *-192-*|*192) KEYSIZE=24 ;;
+    *-256-*|*256) KEYSIZE=32 ;;
+    *)
+      error "Unable to determine key size for cipher: $CIPHER"
+      ;;
+  esac
+
+  echo "$KEYSIZE"
+}
+
+function stash_cipher_blockmode() {
+  local CIPHER=$1
+  local NEED_HMAC=true
+
+  case $CIPHER in
+    *-cbc|*-ctr|*-ofb)
+      IVSIZE=16 NEED_HMAC=true ;;
+    *-gcm|*-ocb)
+      # Previous versions of openssl supported these but didn't check
+      # the authentication data.  Current versions don't allow their
+      # use.
+      error "Unable to use the block mode specified due to limitations of the openssl enc command: $CIPHER"
+      ;;
+    *)
+      error "Unable to determine supported block mode: $CIPHER"
+      ;;
+  esac
+
+  echo "$IVSIZE $NEED_HMAC"
+}
+
+
 # Get the openssl cipher name, key size and iv size.
 function stash_cipher_params() {
   local CIPHER=$1
   local KEYSIZE
   local IVSIZE
 
-  case $CIPHER in
-    aes128|aes-128-cbc|AES-128-CBC)
-      CIPHER=aes-128-cbc
-      KEYSIZE=16
-      IVSIZE=16
-      ;;
+  CIPHER=$(stash_cipher_alias $CIPHER)
+  KEYSIZE=$(stash_cipher_keysize $CIPHER)
 
-    aes192|aes-192-cbc|AES-192-CBC)
-      CIPHER=aes-192-cbc
-      KEYSIZE=24
-      IVSIZE=16
-      ;;
+  set -- $(stash_cipher_blockmode $CIPHER)
+  IVSIZE=$1
+  HMAC=$2
 
-    aes256|aes-256-cbc|AES-256-CBC)
-      CIPHER=aes-256-cbc
-      KEYSIZE=32
-      IVSIZE=16
-      ;;
-
-    *)
-      error "Unknown cipher: $CIPHER"
-  esac
-
-  if [[ -z $IVSIZE ]]; then
-    IVSIZE=$KEYSIZE
-  fi
-
-  echo "$CIPHER $KEYSIZE $IVSIZE"
+  echo "$CIPHER $KEYSIZE $IVSIZE $HMAC"
 }
 
 # Verify the key and IV are the correct sizes.
@@ -257,23 +298,36 @@ function stash_verify_keyiv() {
   local KEYSIZE=$2
   local IVSIZE=$3
 
-  if [[ $(( ${#KEY} / 2 )) != $KEYSIZE ]]; then
-    error "The key is the wrong size: $(( ${#KEY} / 2) )) != $KEYSIZE"
+  local ACTUAL_KEYSIZE=$(( ${#KEY} / 2 ))
+  local ACTUAL_IVSIZE=$(( ${#IV} / 2 ))
+
+  if [[ $ACTUAL_KEYSIZE != $KEYSIZE ]]; then
+    error "The key is the wrong length: $ACTUAL_KEYSIZE != $KEYSIZE"
   fi
 
-  if [[ $(( ${#IV} / 2 )) != $IVSIZE ]]; then
-    error "The iv is the wrong size: $(( ${#IV} / 2 )) != $IVSIZE"
+  if [[ $ACTUAL_IVSIZE != $IVSIZE ]]; then
+    error "The iv is the wrong size: $ACTUAL_IVSIZE != $IVSIZE"
   fi
 }
 
 # Encrypt data
 function openssl_encrypt() {
-  openssl enc -e -$1 -K $2 -iv $3
+  local CIPHER=$1
+  local KEY=$2
+  local IV=$3
+  stash_verify_keyiv $CIPHER $KEY $IV
+
+  openssl enc -e -$CIPHER -K $KEY -iv $IV
 }
 
 # Decrypt data
 function openssl_decrypt() {
-  openssl enc -d -$1 -K $2 -iv $3
+  local CIPHER=$1
+  local KEY=$2
+  local IV=$3
+  stash_verify_keyiv $CIPHER $KEY $IV
+
+  openssl enc -e -$CIPHER -K $KEY -iv $IV
 }
 
 # Create a container using cpio with the encrypted version of
@@ -281,9 +335,10 @@ function openssl_decrypt() {
 # with stdin/out
 function stash_encrypt() {
   set -- $(stash_cipher_params $CIPHER)
-  CIPHER=$1
-  KEYSIZE=$2
-  IVSIZE=$3
+  local CIPHER=$1
+  local KEYSIZE=$2
+  local IVSIZE=$3
+  local NEED_HMAC=$4
 
   if [[ -z $KEY ]]; then
     if [[ $STASH_KEY ]]; then
@@ -297,41 +352,38 @@ function stash_encrypt() {
   stash_nonce $IVSIZE
   IV=$RET
 
-  stash_verify_keyiv $CIPHER $KEY $IV
+  openssl_encrypt $CIPHER $KEY $IV < $INFILE > $TMPDIR/encrypted
+  if [[ $NEED_HMAC = true ]]; then
+    HMAC=$(cat $TMPDIR/encrypted <(echo $IV) | openssl_hmac $DIGEST $KEY)
+  else
+    HMAC=""
+  fi
 
-  # Use process redirectgion to write the encrypted data to
-  # $TMPDIR/encrypted while calculating the HMAC at the same time.
-  # This is to prevent unencrypted data from going to disk, unless
-  # bash is emulating process redirection on your operating system.
-  HMAC=$(tee < $INFILE >(openssl_encrypt $CIPHER $KEY $IV > $TMPDIR/encrypted) | openssl_hmac $DIGEST $KEY)
-
-  echo "Timestamp: $(date -u --iso-8601=seconds)" > $TMPDIR/meta
   echo "Cipher: $CIPHER" >> $TMPDIR/meta
   echo "IV: $IV" >> $TMPDIR/meta
-  echo "HMAC: $HMAC" >> $TMPDIR/meta
 
-  if [[ $VERBOSE = true ]]; then
-    cat $TMPDIR/meta | info-sed 1>&2
+  if [[ $HMAC ]]; then
+    echo "HMAC: $HMAC" >> $TMPDIR/meta
   fi
 
-  if [[ $KEYGEN = true ]] || [[ $VERBOSE = true ]]; then
-    info "Key: $KEY"
+  log-s debug < $TMPDIR/meta 1>&2
+
+  if [[ $KEYGEN = true ]]; then
+    log info "Key: $KEY"
   fi
 
-  (cd $TMPDIR && (echo meta; echo encrypted) | cpio --quiet -o) > $OUTFILE
+  (cd $TMPDIR && ls -1 | cpio --quiet -o) > $OUTFILE
 
-  if [[ $VERBOSE = true ]]; then
-    info "Encryption successful, to decrypt: $0 -d -k $KEY -i $OUTFILE -o $INFILE"
-  fi
+  log debug "Encryption successful, to decrypt: $0 -d -i $OUTFILE -o $INFILE"
 }
 
-# Extract the files from the container, decrypt and verify the HMAC.
-# If the HMAC matches the value from the container, decrypt again and
-# put in $OUTFILE.  TODO: I would like to avoid the double decryption
-# without writing to disk.
+# Extract the files from the container, decrypt and verify the HMAC if provided.
 function stash_decrypt() {
   if [[ -z $KEY ]]; then
-    error "Unable to decrypt without providing a key"
+    read -p 'Key: ' KEY
+    if [[ -z $KEY ]]; then
+      error "Unable to decrypt without providing a key"
+    fi
   fi
 
   (cd $TMPDIR && cpio --quiet -i) < $INFILE
@@ -354,21 +406,33 @@ function stash_decrypt() {
     esac
   done < $TMPDIR/meta
 
+  set -- $(stash_cipher_params $CIPHER)
+  CIPHER=$1
+  KEYSIZE=$2
+  IVSIZE=$3
+  NEED_HMAC=$4
+
   stash_verify_keyiv $CIPHER $KEY $IV
 
-  HMAC_DATA=$(openssl_decrypt $CIPHER $KEY $IV < $TMPDIR/encrypted | openssl_hmac $DIGEST $KEY)
-  set -- $HMAC_DATA
-  HMAC_OUT=$2
+  if [[ $NEED_HMAC = true ]]; then
+    if [[ -z $HMAC_OK ]]; then
+      error "Block mode is not secure and HMAC is missing from control file"
+    fi
+  fi
 
-  if [[ $HMAC_OUT != $HMAC_OK ]]; then
-    error "HMAC verification failed!  Are you using the right key?"
+  if [[ $HMAC_OK ]]; then
+    HMAC=$(cat $TMPDIR/encrypted <(echo $IV) | openssl_hmac $DIGEST $KEY)
+    set -- $HMAC
+    HMAC_OUT=$2
+
+    if [[ $HMAC_OUT != $HMAC_OK ]]; then
+      error "HMAC verification failed!  Are you using the right key?"
+    fi
   fi
 
   openssl_decrypt $CIPHER $KEY $IV < $TMPDIR/encrypted > $OUTFILE
 
-  if [[ $VERBOSE = true ]]; then
-    info "Decryption successful"
-  fi
+  log info "Decryption successful"
 }
 
 # Main function
