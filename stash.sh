@@ -328,9 +328,9 @@ function openssl_decrypt() {
   openssl enc -d -$CIPHER -K $KEY -iv $IV
 }
 
-# Create a container using cpio with the encrypted version of
+# Create a container using zip with the encrypted version of
 # INFILE. The minimum size of tar is rather big, and ar can't be used
-# with stdin/out
+# with stdin/out, and cpio needs weird opts to work with busybox
 function stash_encrypt() {
   set -- $(stash_cipher_params $CIPHER)
   local CIPHER=$1
@@ -370,7 +370,7 @@ function stash_encrypt() {
     log info "Key: $KEY"
   fi
 
-  (cd $TMPDIR && ls -1 | cpio --quiet -o) > $OUTFILE
+  (cd $TMPDIR && zip - -r ./) > $OUTFILE
 
   log debug "Encryption successful, to decrypt: $0 -d -i $OUTFILE -o $INFILE"
 }
@@ -384,7 +384,7 @@ function stash_decrypt() {
     fi
   fi
 
-  (cd $TMPDIR && cpio --quiet -i) < $INFILE
+  (cd $TMPDIR && zip -) < $INFILE
 
   while read line; do
     set -- $line
